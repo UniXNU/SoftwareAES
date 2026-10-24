@@ -1,7 +1,7 @@
-# NativeAES
+# SoftwareAES
 
-Native AES accelerator driver with the original Apple AES ABI.
+Software AES-CBC through IOAESAccelerator.
 
-Current state: built into the kernel and used by the sheng crypto path.
+built into the kernel and used by the sheng crypto path.
 
-Linked into XNU by `unixnu build kernel`.
+Build and interface details: [documentation](https://unixnu.com/drivers/software-aes). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
