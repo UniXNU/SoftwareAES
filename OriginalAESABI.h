@@ -6,6 +6,12 @@
 // Ordinary iOS ABI, qualified against the original component and live metadata.
 class IOCryptoAccelerator : public IOService {
   OSDeclareDefaultStructors(IOCryptoAccelerator)
+#if defined(NATIVE_AES_DARWIN26) && NATIVE_AES_DARWIN26
+  // Darwin 26 (26C5035r, 24A446): the parent declares getAlgorithmName (its slot is signed with
+  // _ZN19IOCryptoAccelerator16getAlgorithmNameEv); IOAESAccelerator overrides it.
+public:
+  virtual const char *getAlgorithmName();
+#endif
 };
 struct IOAESIV { unsigned char bytes[16]; };
 struct IOAESKeyData {
@@ -23,7 +29,11 @@ public:
   bool start(IOService *) override;
   IOWorkLoop *getWorkLoop() const override;
   IOReturn callPlatformFunction(const OSSymbol *, bool, void *, void *, void *, void *) override;
+#if defined(NATIVE_AES_DARWIN26) && NATIVE_AES_DARWIN26
+  const char *getAlgorithmName() override;
+#else
   virtual const char *getAlgorithmName();
+#endif
   virtual IOReturn performAES(void *, void *, task_t, unsigned long long, IOAESIV *,
                              IOAESOperation, IOAESKeyData *, IOAESCompletion, void *);
   virtual IOReturn performAES(IOMemoryDescriptor *, IOMemoryDescriptor *, unsigned long long,
