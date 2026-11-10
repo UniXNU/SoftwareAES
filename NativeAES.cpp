@@ -19,6 +19,9 @@ volatile uint32_t native_aes_interface_status = 0;
 volatile uint32_t native_aes_completed = 0;
 volatile uint32_t native_aes_unsupported_key = 0;
 volatile uint32_t native_aes_nonce_key_uses = 0;
+// The bytes of the completed requests and the time spent in them (mach_absolute_time ticks), for a board's log: together with
+// native_aes_completed they show whether anything sends bulk data through this provider and at what rate it is served.
+volatile uint64_t native_aes_bytes = 0, native_aes_ticks = 0;
 }
 
 // Selector 0x8a4: the device key AppleImage4 entangles its boot nonce with (_darwin_el2_entangle_nonce: 128 bits, zero key bytes,
@@ -196,6 +199,7 @@ IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *ou
   }
   if (inputOffset > input->getLength() || bytes > input->getLength() - inputOffset ||
       outputOffset > output->getLength() || bytes > output->getLength() - outputOffset) return kIOReturnBadArgument;
+  const uint64_t entered = mach_absolute_time();
   unsigned char *buffer = static_cast<unsigned char *>(IOMalloc(4096));
   if (!buffer) return kIOReturnNoMemory;
   IOReturn result = input->prepare();
@@ -224,6 +228,8 @@ IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *ou
   if (!result) {
     memcpy(iv->bytes, chaining, 16);
     __atomic_fetch_add(&native_aes_completed, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_aes_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_aes_ticks, mach_absolute_time() - entered, __ATOMIC_RELAXED);
   }
   cc_clear(4096, buffer);
   IOFree(buffer, 4096);
