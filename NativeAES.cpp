@@ -34,7 +34,7 @@ volatile uint64_t native_aes_bytes = 0, native_aes_ticks = 0;
 enum : uint32_t { kFairPlayLocalKeySelector = 0x899, kNonceEntangleSelector = 0x8a4 };
 static const char kFairPlayKeyLabel[] = "UniXNU software AES key 0x899";
 static const char kNonceKeyLabel[] = "UniXNU software AES key 0x8a4";
-static bool derivedDeviceKey(const char *label, size_t labelBytes, IOAESKeyData *out)
+static bool readUniqueChipId(uint64_t *chipOut)
 {
   uint64_t chip = 0;
   if (IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane)) {
@@ -43,6 +43,13 @@ static bool derivedDeviceKey(const char *label, size_t labelBytes, IOAESKeyData 
     chosen->release();
   }
   if (!chip) return false;
+  if (chipOut) *chipOut = chip;
+  return true;
+}
+static bool derivedDeviceKey(const char *label, size_t labelBytes, IOAESKeyData *out)
+{
+  uint64_t chip = 0;
+  if (!readUniqueChipId(&chip)) return false;
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256_CTX context;
   SHA256_Init(&context);
@@ -53,6 +60,8 @@ static bool derivedDeviceKey(const char *label, size_t labelBytes, IOAESKeyData 
   out->bits = 128;
   memcpy(out->bytes, digest, 16);
   cc_clear(sizeof(digest), digest);
+  cc_clear(sizeof(context), &context);
+  cc_clear(sizeof(chip), &chip);
   return true;
 }
 
@@ -66,7 +75,10 @@ public:
   }
   const char *getAlgorithmName() override { return "AES-CBC"; }
   bool isKeySupported(unsigned selector) override {
-    return selector == 0 || selector == kFairPlayLocalKeySelector || selector == kNonceEntangleSelector;
+    if (selector == 0) return true;
+    if (selector == kFairPlayLocalKeySelector || selector == kNonceEntangleSelector)
+      return readUniqueChipId(nullptr);
+    return false;
   }
   unsigned getSupportedOptions() override { return 1; }
   IOReturn performAES(void *, void *, task_t, unsigned long long, IOAESIV *,
@@ -194,6 +206,10 @@ IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *ou
   if (!input || !output || !key || !iv || !bytes || (bytes & 15) ||
       (key->bits != 128 && key->bits != 192 && key->bits != 256)) return kIOReturnBadArgument;
   IOAESKeyData derived = {};
+  struct DerivedKeyScrubber {
+    IOAESKeyData *data;
+    ~DerivedKeyScrubber() { cc_clear(sizeof(*data), data); }
+  } derivedScrubber{&derived};
   if (key->selector == kNonceEntangleSelector && key->bits == 128 &&
       derivedDeviceKey(kNonceKeyLabel, sizeof(kNonceKeyLabel), &derived)) {
     __atomic_fetch_add(&native_aes_nonce_key_uses, 1, __ATOMIC_RELAXED);
@@ -245,7 +261,6 @@ IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *ou
   cc_clear(4096, buffer);
   IOFree(buffer, 4096);
   cc_clear(sizeof(chaining), chaining);
-  cc_clear(sizeof(derived), &derived);
   output->complete();
   input->complete();
   if (callback) {
