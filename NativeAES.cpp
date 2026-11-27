@@ -18,20 +18,23 @@ volatile uint32_t native_aes_registered = 0;
 volatile uint32_t native_aes_interface_status = 0;
 volatile uint32_t native_aes_completed = 0;
 volatile uint32_t native_aes_unsupported_key = 0;
+volatile uint32_t native_aes_last_unsupported_selector = 0;
 volatile uint32_t native_aes_nonce_key_uses = 0;
+volatile uint32_t native_aes_fairplay_key_uses = 0;
 // The bytes of the completed requests and the time spent in them (mach_absolute_time ticks), for a board's log: together with
 // native_aes_completed they show whether anything sends bulk data through this provider and at what rate it is served.
 volatile uint64_t native_aes_bytes = 0, native_aes_ticks = 0;
 }
 
-// Selector 0x8a4: the device key AppleImage4 entangles its boot nonce with (_darwin_el2_entangle_nonce: 128 bits, zero key bytes,
-// selector 0x8a4, CBC). On Apple hardware it is derived from the UID key; AppleImage4 panics when the request fails ("encryption
-// failed: 0xe00002c7", macOS run47, from a nonce sysctl as System Settings opened). This board has no hardware key, so the stand-in is
-// derived from /chosen/unique-chip-id: unique to the device and stable, but not secret from software, which the service's
-// NativeAESSoftwareKeysOnly property states. Every other hardware selector (the GID keys that decrypt firmware, the raw UID key) stays
-// unsupported: a made-up key there would hand back wrong plaintext instead of an error.
-enum : uint32_t { kNonceEntangleSelector = 0x8a4 };
-static bool nonceEntangleKey(IOAESKeyData *out)
+// Per-device UID-parented selectors (0x8a4: AppleImage4 boot nonce entangling in _darwin_el2_entangle_nonce; 0x899: FairPlayIOKit
+// local state wrapping for /private/var/db/adi and /private/var/db/fpsd). On Apple hardware both descend from per-device UID1 (parent
+// 2000), unknown to Apple servers; this board has no hardware UID key, so domain-separated SHA-256 keys are derived from
+// /chosen/unique-chip-id (NativeAESSoftwareKeysOnly = true). Shared GID selectors (such as 0x8a1, parent 1001) and raw hardware keys
+// stay unsupported and record native_aes_last_unsupported_selector.
+enum : uint32_t { kFairPlayLocalKeySelector = 0x899, kNonceEntangleSelector = 0x8a4 };
+static const char kFairPlayKeyLabel[] = "UniXNU software AES key 0x899";
+static const char kNonceKeyLabel[] = "UniXNU software AES key 0x8a4";
+static bool derivedDeviceKey(const char *label, size_t labelBytes, IOAESKeyData *out)
 {
   uint64_t chip = 0;
   if (IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane)) {
@@ -40,11 +43,10 @@ static bool nonceEntangleKey(IOAESKeyData *out)
     chosen->release();
   }
   if (!chip) return false;
-  static const char label[] = "UniXNU software AES key 0x8a4";
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256_CTX context;
   SHA256_Init(&context);
-  SHA256_Update(&context, label, sizeof(label));
+  SHA256_Update(&context, label, labelBytes);
   SHA256_Update(&context, &chip, sizeof(chip));
   SHA256_Final(digest, &context);
   memset(out, 0, sizeof(*out));
@@ -63,7 +65,9 @@ public:
     return IOService::callPlatformFunction(name, wait, a, b, c, d);
   }
   const char *getAlgorithmName() override { return "AES-CBC"; }
-  bool isKeySupported(unsigned selector) override { return selector == 0 || selector == kNonceEntangleSelector; }
+  bool isKeySupported(unsigned selector) override {
+    return selector == 0 || selector == kFairPlayLocalKeySelector || selector == kNonceEntangleSelector;
+  }
   unsigned getSupportedOptions() override { return 1; }
   IOReturn performAES(void *, void *, task_t, unsigned long long, IOAESIV *,
                      IOAESOperation, IOAESKeyData *, IOAESCompletion, void *) override;
@@ -175,6 +179,7 @@ bool NativeAES::start(IOService *provider)
       !IOService::start(provider)) return false;
   native_aes_kat_status = knownAnswerTest(this) ? 1 : 2;
   if (native_aes_kat_status != 1) return false;
+  __atomic_store_n(&native_aes_last_unsupported_selector, 0, __ATOMIC_RELAXED);
   setProperty("NativeAESSoftwareKeysOnly", true);
   native_aes_registered = 1;
   registerService();
@@ -189,11 +194,17 @@ IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *ou
   if (!input || !output || !key || !iv || !bytes || (bytes & 15) ||
       (key->bits != 128 && key->bits != 192 && key->bits != 256)) return kIOReturnBadArgument;
   IOAESKeyData derived = {};
-  if (key->selector == kNonceEntangleSelector && key->bits == 128 && nonceEntangleKey(&derived)) {
+  if (key->selector == kNonceEntangleSelector && key->bits == 128 &&
+      derivedDeviceKey(kNonceKeyLabel, sizeof(kNonceKeyLabel), &derived)) {
     __atomic_fetch_add(&native_aes_nonce_key_uses, 1, __ATOMIC_RELAXED);
+    key = &derived;
+  } else if (key->selector == kFairPlayLocalKeySelector && key->bits == 128 &&
+             derivedDeviceKey(kFairPlayKeyLabel, sizeof(kFairPlayKeyLabel), &derived)) {
+    __atomic_fetch_add(&native_aes_fairplay_key_uses, 1, __ATOMIC_RELAXED);
     key = &derived;
   }
   if (key->selector || (operation != IOAESEncrypt && operation != IOAESDecrypt)) {
+    if (key->selector) __atomic_store_n(&native_aes_last_unsupported_selector, key->selector, __ATOMIC_RELAXED);
     __atomic_fetch_add(&native_aes_unsupported_key, 1, __ATOMIC_RELAXED);
     return kIOReturnUnsupported;
   }
